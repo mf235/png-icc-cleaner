@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import shutil
 import struct
 import sys
@@ -59,6 +60,7 @@ from tkinter import filedialog, ttk
 
 APP_TITLE = "PNGプロファイルクリーナー"
 SETTINGS_FILE_NAME = "png-icc-cleaner-settings.json"
+DEFAULT_WINDOW_GEOMETRY = "1060x740"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 BACKUP_DIR_NAME = "_backup"
 
@@ -349,6 +351,57 @@ def save_settings(data: dict) -> None:
         # 設定保存に失敗しても本処理は止めない。
         pass
 
+
+def parse_geometry_string(value: object) -> Optional[Tuple[int, int, Optional[int], Optional[int]]]:
+    """Tk geometry string を (width, height, x, y) に分解する。"""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    match = re.fullmatch(r"(\d+)x(\d+)(?:([+-]\d+)([+-]\d+))?", text)
+    if not match:
+        return None
+    width = int(match.group(1))
+    height = int(match.group(2))
+    x = int(match.group(3)) if match.group(3) is not None else None
+    y = int(match.group(4)) if match.group(4) is not None else None
+    return width, height, x, y
+
+
+def build_safe_geometry(root: tk.Tk, saved: object, default: str = DEFAULT_WINDOW_GEOMETRY) -> str:
+    """保存済み geometry を画面外になりにくい形に補正して返す。"""
+    parsed = parse_geometry_string(saved) or parse_geometry_string(default)
+    if parsed is None:
+        return default
+
+    width, height, x, y = parsed
+    min_width = 860
+    min_height = 560
+
+    try:
+        screen_w = max(640, int(root.winfo_screenwidth()))
+        screen_h = max(480, int(root.winfo_screenheight()))
+    except Exception:
+        screen_w, screen_h = 1920, 1080
+
+    width = max(min_width, min(width, max(min_width, screen_w)))
+    height = max(min_height, min(height, max(min_height, screen_h)))
+
+    if x is None or y is None:
+        return f"{width}x{height}"
+
+    # タイトルバーや端だけでも画面内に残るように補正。
+    visible_margin = 80
+    max_x = max(0, screen_w - visible_margin)
+    max_y = max(0, screen_h - visible_margin)
+    min_x = min(0, visible_margin - width)
+    min_y = min(0, visible_margin - height)
+    x = min(max(x, min_x), max_x)
+    y = min(max(y, min_y), max_y)
+
+    return f"{width}x{height}{x:+d}{y:+d}"
+
 def summarize_chunks(chunks: Sequence[str]) -> str:
     targets = []
     for name in ("iCCP", "sRGB", "gAMA", "cHRM", "tEXt", "zTXt", "iTXt", "eXIf", "tIME", "acTL"):
@@ -361,10 +414,11 @@ class PngProfileCleanerApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title(APP_TITLE)
-        self.root.geometry("1060x740")
         self.root.minsize(860, 560)
 
         self.settings = load_settings()
+        self.root.geometry(build_safe_geometry(self.root, self.settings.get("window_geometry"), DEFAULT_WINDOW_GEOMETRY))
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         saved_folder = str(self.settings.get("folder", "")).strip()
         if not saved_folder or not Path(saved_folder).exists():
             saved_folder = str(Path.cwd())
@@ -508,12 +562,22 @@ class PngProfileCleanerApp:
     def clear_log(self) -> None:
         self.log_text.delete("1.0", tk.END)
 
-    def save_current_settings(self) -> None:
+    def save_current_settings(self, include_geometry: bool = False) -> None:
         self.settings["folder"] = self.folder_var.get().strip()
         self.settings["scan_mode"] = self.scan_mode_var.get()
         self.settings["include_backup"] = bool(self.include_backup_var.get())
         self.settings["rewrite_all"] = bool(self.rewrite_all_var.get())
+        if include_geometry:
+            try:
+                self.root.update_idletasks()
+                self.settings["window_geometry"] = self.root.geometry()
+            except Exception:
+                pass
         save_settings(self.settings)
+
+    def on_close(self) -> None:
+        self.save_current_settings(include_geometry=True)
+        self.root.destroy()
 
     def log(self, message: str = "") -> None:
         self.log_text.insert(tk.END, message + "\n")
