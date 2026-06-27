@@ -61,6 +61,8 @@ from tkinter import filedialog, ttk
 APP_TITLE = "PNGプロファイルクリーナー"
 SETTINGS_FILE_NAME = "png-icc-cleaner-settings.json"
 DEFAULT_WINDOW_GEOMETRY = "1060x740"
+WINDOW_STATE_NORMAL = "normal"
+WINDOW_STATE_ZOOMED = "zoomed"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 BACKUP_DIR_NAME = "_backup"
 
@@ -369,8 +371,32 @@ def parse_geometry_string(value: object) -> Optional[Tuple[int, int, Optional[in
     return width, height, x, y
 
 
+def is_probably_maximized_geometry(root: tk.Tk, geometry_text: str) -> bool:
+    """最大化時に保存されたような geometry かどうかをゆるく判定する。"""
+    parsed = parse_geometry_string(geometry_text)
+    if parsed is None:
+        return False
+    width, height, x, y = parsed
+    try:
+        screen_w = max(640, int(root.winfo_screenwidth()))
+        screen_h = max(480, int(root.winfo_screenheight()))
+    except Exception:
+        screen_w, screen_h = 1920, 1080
+
+    # Windows の最大化 geometry は 1936x1056-8-8 のように、画面より少し大きく負座標に
+    # なることがある。これを通常ウィンドウ位置として保存・復元すると座標が崩れる。
+    near_full_width = width >= screen_w - 24
+    near_full_height = height >= screen_h - 80
+    slightly_outside = (x is not None and x <= 0) or (y is not None and y <= 0)
+    return near_full_width and near_full_height and slightly_outside
+
+
 def build_safe_geometry(root: tk.Tk, saved: object, default: str = DEFAULT_WINDOW_GEOMETRY) -> str:
-    """保存済み geometry を画面外になりにくい形に補正して返す。"""
+    """保存済み通常時 geometry を画面外になりにくい形に補正して返す。"""
+    if isinstance(saved, str) and is_probably_maximized_geometry(root, saved):
+        # v6 以前で最大化 geometry をそのまま保存していた場合の救済。
+        saved = None
+
     parsed = parse_geometry_string(saved) or parse_geometry_string(default)
     if parsed is None:
         return default
@@ -385,8 +411,11 @@ def build_safe_geometry(root: tk.Tk, saved: object, default: str = DEFAULT_WINDO
     except Exception:
         screen_w, screen_h = 1920, 1080
 
-    width = max(min_width, min(width, max(min_width, screen_w)))
-    height = max(min_height, min(height, max(min_height, screen_h)))
+    # 通常ウィンドウとして復元するサイズなので、最大化相当までは広げない。
+    max_width = max(min_width, screen_w - 80)
+    max_height = max(min_height, screen_h - 120)
+    width = max(min_width, min(width, max_width))
+    height = max(min_height, min(height, max_height))
 
     if x is None or y is None:
         return f"{width}x{height}"
@@ -401,6 +430,40 @@ def build_safe_geometry(root: tk.Tk, saved: object, default: str = DEFAULT_WINDO
     y = min(max(y, min_y), max_y)
 
     return f"{width}x{height}{x:+d}{y:+d}"
+
+
+def get_tk_window_state(root: tk.Tk) -> str:
+    """通常/最大化状態を取得する。Tk/OS差分はここで吸収する。"""
+    try:
+        state = str(root.state())
+        if state == WINDOW_STATE_ZOOMED:
+            return WINDOW_STATE_ZOOMED
+        if state == "iconic":
+            return "iconic"
+    except Exception:
+        pass
+    try:
+        if bool(root.attributes("-zoomed")):
+            return WINDOW_STATE_ZOOMED
+    except Exception:
+        pass
+    return WINDOW_STATE_NORMAL
+
+
+def apply_window_state(root: tk.Tk, state: object) -> None:
+    """保存されたウィンドウ状態を復元する。"""
+    if state != WINDOW_STATE_ZOOMED:
+        return
+    try:
+        root.state(WINDOW_STATE_ZOOMED)
+        return
+    except Exception:
+        pass
+    try:
+        root.attributes("-zoomed", True)
+    except Exception:
+        pass
+
 
 def summarize_chunks(chunks: Sequence[str]) -> str:
     targets = []
@@ -417,8 +480,17 @@ class PngProfileCleanerApp:
         self.root.minsize(860, 560)
 
         self.settings = load_settings()
-        self.root.geometry(build_safe_geometry(self.root, self.settings.get("window_geometry"), DEFAULT_WINDOW_GEOMETRY))
+        self._tracking_geometry = False
+        self._last_normal_geometry = build_safe_geometry(
+            self.root,
+            self.settings.get("window_normal_geometry", self.settings.get("window_geometry")),
+            DEFAULT_WINDOW_GEOMETRY,
+        )
+        self.root.geometry(self._last_normal_geometry)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.root.bind("<Configure>", self._on_configure, add="+")
+        self.root.after(100, self._restore_saved_window_state)
+        self.root.after(300, self._enable_geometry_tracking)
         saved_folder = str(self.settings.get("folder", "")).strip()
         if not saved_folder or not Path(saved_folder).exists():
             saved_folder = str(Path.cwd())
@@ -562,6 +634,33 @@ class PngProfileCleanerApp:
     def clear_log(self) -> None:
         self.log_text.delete("1.0", tk.END)
 
+    def _enable_geometry_tracking(self) -> None:
+        self._tracking_geometry = True
+        self._remember_normal_geometry()
+
+    def _restore_saved_window_state(self) -> None:
+        # 通常 geometry を先に復元してから最大化する。
+        # 最大化 geometry そのものを保存・復元すると環境によって座標が崩れるため。
+        apply_window_state(self.root, self.settings.get("window_state"))
+
+    def _remember_normal_geometry(self) -> None:
+        try:
+            if get_tk_window_state(self.root) != WINDOW_STATE_NORMAL:
+                return
+            geometry = self.root.geometry()
+            if parse_geometry_string(geometry) is None:
+                return
+            if is_probably_maximized_geometry(self.root, geometry):
+                return
+            self._last_normal_geometry = geometry
+        except Exception:
+            pass
+
+    def _on_configure(self, _event: object) -> None:
+        if not self._tracking_geometry:
+            return
+        self._remember_normal_geometry()
+
     def save_current_settings(self, include_geometry: bool = False) -> None:
         self.settings["folder"] = self.folder_var.get().strip()
         self.settings["scan_mode"] = self.scan_mode_var.get()
@@ -570,7 +669,20 @@ class PngProfileCleanerApp:
         if include_geometry:
             try:
                 self.root.update_idletasks()
-                self.settings["window_geometry"] = self.root.geometry()
+                window_state = get_tk_window_state(self.root)
+                if window_state == WINDOW_STATE_NORMAL:
+                    self._remember_normal_geometry()
+                    save_state = WINDOW_STATE_NORMAL
+                elif window_state == WINDOW_STATE_ZOOMED:
+                    save_state = WINDOW_STATE_ZOOMED
+                else:
+                    # 最小化終了などは次回通常表示に戻す。
+                    save_state = WINDOW_STATE_NORMAL
+
+                self.settings["window_state"] = save_state
+                self.settings["window_normal_geometry"] = self._last_normal_geometry
+                # v6 以前との互換用。今後は window_normal_geometry が正。
+                self.settings["window_geometry"] = self._last_normal_geometry
             except Exception:
                 pass
         save_settings(self.settings)
