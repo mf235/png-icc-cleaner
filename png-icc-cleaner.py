@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-png-icc-cleaner-v4.py
+png-icc-cleaner.py
 
 PNG の色管理メタデータ由来の libpng warning 対策用 GUI ツール。
 
@@ -57,7 +57,7 @@ import tkinter as tk
 from tkinter import filedialog, ttk
 
 
-APP_TITLE = "PNG Profile Cleaner v4"
+APP_TITLE = "PNGプロファイルクリーナー"
 SETTINGS_FILE_NAME = "png-icc-cleaner-settings.json"
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 BACKUP_DIR_NAME = "_backup"

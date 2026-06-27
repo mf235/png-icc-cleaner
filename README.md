@@ -1,4 +1,4 @@
-# PNG Profile Cleaner
+# PNGプロファイルクリーナー
 
 ![スクリーンショット](images/ss.jpg)
 
